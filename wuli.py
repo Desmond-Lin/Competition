@@ -5,13 +5,15 @@ from sklearn.metrics import f1_score
 from sklearn.model_selection import train_test_split
 from lightgbm.sklearn import LGBMClassifier
 import time
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import f1_score
+import lightgbm as lgb
 from mpl_toolkits.mplot3d import Axes3D
 
 t = time.time()
 train_df_source = pd.read_csv('C://Users//Lin//Desktop//PolyU//competition//turing_wuli//train.csv')
 test_df_source = pd.read_csv('C://Users//Lin//Desktop//PolyU//competition//turing_wuli//test.csv')
 event_df_source = pd.read_csv('C://Users//Lin//Desktop//PolyU//competition//turing_wuli//event.csv')
-
 
 # flag 0: 0.370793 1: 0.629207
 # test = df.groupby('flag').count()
@@ -45,9 +47,9 @@ def f_eng(df, event_df, is_train=True):
                   on='event_id')
     # df['dis'] = np.sqrt(df['x']**2+df['y']**2+df['t']**2)
     # 时间差
-    df['t_o']=df['t']-df['terror']
-    df['q_mean'] = df['q']-df['q'].groupby(df['event_id']).transform(np.mean)
-    df['t_mean'] = df['t']-df['t'].groupby(df['event_id']).transform(np.mean)
+    df['t_o'] = df['t'] - df['terror']
+    df['q_mean'] = df['q'] - df['q'].groupby(df['event_id']).transform(np.mean)
+    df['t_mean'] = df['t'] - df['t'].groupby(df['event_id']).transform(np.mean)
     if is_train:
         df = df.drop('flag', axis=1)
     df = df.drop(['hit_id', 'z', 'event_id'], axis=1)
@@ -59,10 +61,8 @@ train_df = f_eng(train_df_source, event_df_source)
 test_df = f_eng(test_df_source, event_df_source, False)
 print(train_df.columns.values.tolist())
 # 小样本训练
-train_df = train_df.iloc[:3000000, :]
-labels = labels[:3000000]
-
-train_x, val_x, train_y, val_y = train_test_split(train_df, labels, test_size=0.33, random_state=42)
+train_df = train_df.iloc[:100000, :]
+labels = labels[:100000]
 
 threshold = 0.5
 
@@ -70,13 +70,9 @@ threshold = 0.5
 # 自定义Metric函数
 def score(labels, pred):
     # labels = train_data.get_label()
+    labels = labels.astype(int)
 
     pred = np.array([1 if x >= threshold else 0 for x in pred])
-    # print(labels.__class__)
-    # print(pred.__class__)
-    # print(labels)
-    # print(pred)
-    labels = labels.astype(int)
     # Nhitrealrange：真实为信号，预测也为信号的数量
     nhitrealrange = sum(labels & pred)
 
@@ -105,109 +101,174 @@ def score(labels, pred):
     return metric
 
 
-print(
-    '=============================================== training validate ===============================================')
-fea_imp_list = []
-clf = LGBMClassifier(
-    learning_rate=0.01,
-    n_estimators=20000,
-    num_leaves=255,
-    subsample=0.9,
-    colsample_bytree=0.8,
-    random_state=2019,
-    metric=None
-)
+n_fold = 10
+skf = StratifiedKFold(n_splits=n_fold, shuffle=True)
+eval_fun = f1_score
 
-print('************** training **************')
-clf.fit(
-    train_x, train_y,
-    eval_set=[(val_x, val_y)],
-    eval_metric='auc',
-    # categorical_feature=cate_cols,
-    early_stopping_rounds=200,
-    # early_stopping_rounds=50,
-    verbose=50
-)
-print('runtime:', time.time() - t)
 
-print('************** validate predict **************')
-best_rounds = clf.best_iteration_
-best_auc = clf.best_score_['valid_0']['auc']
-val_pred = clf.predict_proba(val_x)[:, 1]
-fea_imp_list.append(clf.feature_importances_)
-print('runtime:', time.time() - t)
+def run_oof(clf, X_train, y_train, X_test, kf):
+    print(clf)
+    preds_train = np.zeros((len(X_train), 2), dtype=np.float)
+    preds_test = np.zeros((len(X_test), 2), dtype=np.float)
+    train_loss = []
+    eval_loss = []
 
-print(
-    '=============================================== training predict ===============================================')
-clf = LGBMClassifier(
-    learning_rate=0.01,
-    n_estimators=best_rounds,
-    num_leaves=255,
-    subsample=0.9,
-    colsample_bytree=0.8,
-    random_state=2019
-)
+    i = 1
+    for train_index, eval_index in kf.split(X_train, y_train):
+        x_tr = X_train.loc[train_index]
+        x_eval = X_train.loc[eval_index]
+        y_tr = y_train.loc[train_index]
+        y_eval = y_train.loc[eval_index]
+        clf.fit(x_tr, y_tr, eval_set=[(x_eval, y_eval)], early_stopping_rounds=200, verbose=False)
 
-print('************** training **************')
-clf.fit(
-    train_df, labels,
-    eval_set=[(train_df, labels)],
-    eval_metric='auc',
-    # categorical_feature=cate_cols,
-    early_stopping_rounds=200,
-    # early_stopping_rounds=50,
-    verbose=50
-)
-print('runtime:', time.time() - t)
+        train_loss.append(eval_fun(y_tr, np.argmax(clf.predict_proba(x_tr)[:], 1), average='macro'))
+        eval_loss.append(eval_fun(y_eval, np.argmax(clf.predict_proba(x_eval)[:], 1), average='macro'))
 
-print('************** test predict **************')
-test_pre = pd.DataFrame(clf.predict_proba(test_df)[:, 1], columns=['flag_pred'])
-print('test_pre runtime:', time.time() - t)
-sub = pd.concat([test_df_source['hit_id'], test_pre,test_df_source['event_id']], axis=1)
-fea_imp_list.append(clf.feature_importances_)
-print('runtime:', time.time() - t)
+        preds_train[eval_index] = clf.predict_proba(x_eval)[:]
+        preds_test += clf.predict_proba(X_test)[:]
 
-print(
-    '=============================================== feat importances ===============================================')
-# 特征重要性可以好好看看
-fea_imp_dict = dict(zip(train_df.columns.values, np.mean(fea_imp_list, axis=0)))
-fea_imp_item = sorted(fea_imp_dict.items(), key=lambda x: x[1], reverse=True)
-for f, imp in fea_imp_item:
-    print('{} = {}'.format(f, imp))
+        print('{0}: Train {1:0.7f} Val {2:0.7f}/{3:0.7f}'.format(i, train_loss[-1], eval_loss[-1], np.mean(eval_loss)))
+        print('-' * 50)
+        i += 1
+    print('Train: ', train_loss)
+    print('Val: ', eval_loss)
+    print('-' * 50)
+    print('Train{0:0.5f}_Test{1:0.5f}\n\n'.format(np.mean(train_loss), np.mean(eval_loss)))
+    preds_test /= n_fold
+    return preds_train, preds_test, np.mean(eval_loss)
 
-print(
-    '=============================================== threshold search ===============================================')
-# f1阈值敏感，所以对阈值做一个简单的迭代搜索。
-t0 = 0.05
-v = 0.002
-best_t = t0
-best_f1 = 0
-for step in range(475):
-    curr_t = t0 + step * v
-    y = [1 if x >= curr_t else 0 for x in val_pred]
-    curr_f1 = score(val_y, y)
-    if curr_f1 > best_f1:
-        best_t = curr_t
-        best_f1 = curr_f1
-        print('step: {}   best threshold: {}   best score: {}'.format(step, best_t, best_f1))
-print('search finish.')
 
-val_pred = [1 if x >= best_t else 0 for x in val_pred]
-print('\nbest auc:', best_auc)
-print('best score:', score(val_y, val_pred))
-print('validate mean:', np.mean(val_pred))
-print('runtime:', time.time() - t)
+params = {
+    'learning_rate': 0.01,
+    'min_child_samples': 5,
+    'num_leaves': 15,
+    'max_depth': 8,
+    'lambda_l1': 2,
+    'boosting': 'gbdt',
+    'objective': 'binary',
+    'n_estimators': 2000,
+    'metric': 'auc',
+    'feature_fraction': .75,
+    'bagging_fraction': .85,
+    'seed': 99,
+    'num_threads': 20,
+    'verbose': -1
+}
 
-print('=============================================== sub save ===============================================')
-sub.to_csv(
-    'C://Users//Lin//Desktop//PolyU//competition//turing_wuli//sub_prob_{}_{}_{}.csv'.format(best_auc, best_f1,
-                                                                                             sub[
-                                                                                                 'flag_pred'].mean()),
-    index=False)
-sub['flag_pred'] = sub['flag_pred'].apply(lambda x: 1 if x >= best_t else 0)
-sub.to_csv('C://Users//Lin//Desktop//PolyU//competition//turing_wuli//output//sub_{}_{}_{}.csv'.format(best_auc, best_f1,
-                                                                                            sub['flag_pred'].mean()),
+train_pred, test_pred, eval_loss = run_oof(lgb.LGBMClassifier(**params), train_df, labels, test_df, skf)
+test_df_source['flag_pred'] = np.argmax(test_pred, 1)
+len(test_pred)
+len(test_df_source)
+sub = pd.concat([test_df_source['hit_id'], test_df_source['flag_pred'], test_df_source['event_id']], axis=1)
+sub.to_csv('C://Users//Lin//Desktop//PolyU//competition//turing_wuli//output//sub_{}.csv'.format(eval_loss),
            index=False)
 print('runtime:', time.time() - t)
 print('finish.')
 print('========================================================================================================')
+
+# print(
+#     '=============================================== training validate ===============================================')
+# fea_imp_list = []
+# clf = LGBMClassifier(
+#     learning_rate=0.01,
+#     n_estimators=20000,
+#     num_leaves=255,
+#     subsample=0.9,
+#     colsample_bytree=0.8,
+#     random_state=2019,
+#     metric=None
+# )
+#
+# print('************** training **************')
+# clf.fit(
+#     train_x, train_y,
+#     eval_set=[(val_x, val_y)],
+#     eval_metric='auc',
+#     # categorical_feature=cate_cols,
+#     early_stopping_rounds=200,
+#     # early_stopping_rounds=50,
+#     verbose=50
+# )
+# print('runtime:', time.time() - t)
+#
+# print('************** validate predict **************')
+# best_rounds = clf.best_iteration_
+# best_auc = clf.best_score_['valid_0']['auc']
+# val_pred = clf.predict_proba(val_x)[:, 1]
+# fea_imp_list.append(clf.feature_importances_)
+# print('runtime:', time.time() - t)
+#
+# print(
+#     '=============================================== training predict ===============================================')
+# clf = LGBMClassifier(
+#     learning_rate=0.01,
+#     n_estimators=best_rounds,
+#     num_leaves=255,
+#     subsample=0.9,
+#     colsample_bytree=0.8,
+#     random_state=2019
+# )
+#
+# print('************** training **************')
+# clf.fit(
+#     train_df, labels,
+#     eval_set=[(train_df, labels)],
+#     eval_metric='auc',
+#     # categorical_feature=cate_cols,
+#     early_stopping_rounds=200,
+#     # early_stopping_rounds=50,
+#     verbose=50
+# )
+# print('runtime:', time.time() - t)
+#
+# print('************** test predict **************')
+# test_pre = pd.DataFrame(clf.predict_proba(test_df)[:, 1], columns=['flag_pred'])
+# print('test_pre runtime:', time.time() - t)
+# sub = pd.concat([test_df_source['hit_id'], test_pre,test_df_source['event_id']], axis=1)
+# fea_imp_list.append(clf.feature_importances_)
+# print('runtime:', time.time() - t)
+#
+# print(
+#     '=============================================== feat importances ===============================================')
+# # 特征重要性可以好好看看
+# fea_imp_dict = dict(zip(train_df.columns.values, np.mean(fea_imp_list, axis=0)))
+# fea_imp_item = sorted(fea_imp_dict.items(), key=lambda x: x[1], reverse=True)
+# for f, imp in fea_imp_item:
+#     print('{} = {}'.format(f, imp))
+#
+# print(
+#     '=============================================== threshold search ===============================================')
+# # f1阈值敏感，所以对阈值做一个简单的迭代搜索。
+# t0 = 0.05
+# v = 0.002
+# best_t = t0
+# best_f1 = 0
+# for step in range(475):
+#     curr_t = t0 + step * v
+#     y = [1 if x >= curr_t else 0 for x in val_pred]
+#     curr_f1 = score(val_y, y)
+#     if curr_f1 > best_f1:
+#         best_t = curr_t
+#         best_f1 = curr_f1
+#         print('step: {}   best threshold: {}   best score: {}'.format(step, best_t, best_f1))
+# print('search finish.')
+#
+# val_pred = [1 if x >= best_t else 0 for x in val_pred]
+# print('\nbest auc:', best_auc)
+# print('best score:', score(val_y, val_pred))
+# print('validate mean:', np.mean(val_pred))
+# print('runtime:', time.time() - t)
+#
+# print('=============================================== sub save ===============================================')
+# sub.to_csv(
+#     'C://Users//Lin//Desktop//PolyU//competition//turing_wuli//sub_prob_{}_{}_{}.csv'.format(best_auc, best_f1,
+#                                                                                              sub[
+#                                                                                                  'flag_pred'].mean()),
+#     index=False)
+# sub['flag_pred'] = sub['flag_pred'].apply(lambda x: 1 if x >= best_t else 0)
+# sub.to_csv('C://Users//Lin//Desktop//PolyU//competition//turing_wuli//output//sub_{}_{}_{}.csv'.format(best_auc, best_f1,
+#                                                                                             sub['flag_pred'].mean()),
+#            index=False)
+# print('runtime:', time.time() - t)
+# print('finish.')
+# print('========================================================================================================')
